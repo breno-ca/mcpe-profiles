@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # permite disparar manualmente pela aba Actions
+
+permissions:
+  contents: write      # necessário para criar release e anexar assets
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc \
+            libgl1-mesa-dev \
+            xorg-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            wayland-protocols
+
+      - name: Build static binary (musl)
+        run: |
+          cd cmd/mcpe-profiles
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+            go build -ldflags "-s -w" \
+            -o mcpe-profiles-linux-amd64 .
+
+      - name: Verify static
+        run: |
+          file cmd/mcpe-profiles/mcpe-profiles-linux-amd64
+          ldd cmd/mcpe-profiles/mcpe-profiles-linux-amd64 || true
+
+      - name: Package source zip
+        run: |
+          git archive --format=zip \
+            --prefix=mcpe-profiles-${GITHUB_SHA::7}/ \
+            -o mcpe-profiles-source-${GITHUB_SHA::7}.zip HEAD
+
+      - name: Generate SHA256
+        run: |
+          sha256sum cmd/mcpe-profiles/mcpe-profiles-linux-amd64 \
+                    mcpe-profiles-source-${GITHUB_SHA::7}.zip \
+            > SHA256SUMS
+
+      - name: Create/update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          body: |
+            Build automática do commit `${{ github.sha }}`.
+
+            - **Binário:** `mcpe-profiles-linux-amd64` (estático, Linux)
+            - **Código:** `mcpe-profiles-source-<sha>.zip`
+          files: |
+            cmd/mcpe-profiles/mcpe-profiles-linux-amd64
+            mcpe-profiles-source-*.zip
+            SHA256SUMS
+          draft: false
+          prerelease: false
