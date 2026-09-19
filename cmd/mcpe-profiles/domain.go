@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 const (
@@ -53,11 +54,9 @@ func applicationsPath() string { return filepath.Join(homeDir(), ".local", "shar
 func profilePath(name string) string { return filepath.Join(profilesPath(), name) }
 
 // subhomeRoot é a raiz onde ficam as HOMEs isoladas dos perfis.
-// É a única fonte de verdade — nada de "subhome" hardcoded solto por aí.
 func subhomeRoot() string { return filepath.Join(homeDir(), "mcpe-profiles") }
 
-// profileHome devolve o caminho da HOME isolada de um perfil,
-// no formato "~/mcpe-profiles/<nome>".
+// profileHome devolve o caminho da HOME isolada de um perfil.
 func profileHome(name string) string { return subhomePrefix + name }
 
 func expandHome(path string) string {
@@ -96,7 +95,6 @@ func saveProfile(p Profile) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	// garante a HOME do perfil
 	if err := ensureProfileHome(p.Name); err != nil {
 		return err
 	}
@@ -124,7 +122,10 @@ func loadProfile(name string) (Profile, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "profile.toml"))
 	if err != nil {
 		// perfil ainda não salvo — só existe a pasta em ~/mcpe-profiles/
-		return p, nil
+		if os.IsNotExist(err) {
+			return p, nil
+		}
+		return Profile{}, err
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		key, val, ok := strings.Cut(strings.TrimSpace(line), "=")
@@ -144,7 +145,10 @@ func loadProfile(name string) (Profile, error) {
 
 	data, err = os.ReadFile(filepath.Join(dir, "ignored_controllers.txt"))
 	if err != nil {
-		return p, nil
+		if os.IsNotExist(err) {
+			return p, nil
+		}
+		return Profile{}, err
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		if v := strings.TrimSpace(line); v != "" {
@@ -177,7 +181,6 @@ func ensureProfileHome(name string) error {
 func listProfiles() []string {
 	seen := map[string]bool{}
 
-	// 1. perfis salvos (config)
 	if entries, err := os.ReadDir(profilesPath()); err == nil {
 		for _, e := range entries {
 			if e.IsDir() {
@@ -186,7 +189,6 @@ func listProfiles() []string {
 		}
 	}
 
-	// 2. pastas na raiz da subhome (corrigido: usa subhomeRoot())
 	if entries, err := os.ReadDir(subhomeRoot()); err == nil {
 		for _, e := range entries {
 			if e.IsDir() {
@@ -215,6 +217,13 @@ func renameProfile(oldName, newName string) error {
 	if _, err := os.Stat(profilePath(newName)); err == nil {
 		return fmt.Errorf("já existe um perfil com o nome %q", newName)
 	}
+
+	// carrega ANTES de mover, para preservar controllers
+	old, err := loadProfile(oldName)
+	if err != nil {
+		return fmt.Errorf("carregar perfil antigo: %w", err)
+	}
+
 	if err := os.Rename(profilePath(oldName), profilePath(newName)); err != nil {
 		return err
 	}
@@ -230,13 +239,10 @@ func renameProfile(oldName, newName string) error {
 		}
 	}
 
-	p, err := loadProfile(newName)
-	if err != nil {
-		return err
-	}
-	p.Name = newName
-	p.Home = profileHome(newName)
-	return saveProfile(p)
+	// recria o perfil com o novo nome, PRESERVANDO os controllers
+	old.Name = newName
+	old.Home = profileHome(newName)
+	return saveProfile(old)
 }
 
 // --- Desktop entry ---
@@ -317,27 +323,19 @@ func isGameController(ev string) bool {
 	keyBits, _ := parseHexBitmap(string(keyData))
 	absBits, _ := parseHexBitmap(string(absData))
 
-	// Tem EV_KEY? (bit 0x01)
 	if !evBits[0x01] {
 		return false
 	}
 
-	// BTN_JOYSTICK (0x120..0x12b) ou BTN_GAMEPAD (0x130..0x13b)
 	for b := 0x120; b <= 0x13b; b++ {
 		if keyBits[b] {
 			return true
 		}
 	}
 
-	// ABS_HAT0X (0x10) indica D-pad → gamepad/joystick
-	if absBits[0x10] {
-		return true
-	}
-
-	return false
+	return absBits[0x10]
 }
 
-// parseHexBitmap converte "ff000000 0000..." em um map[int]bool de bits.
 func parseHexBitmap(s string) (map[int]bool, error) {
 	bits := map[int]bool{}
 	words := strings.Fields(strings.TrimSpace(s))
@@ -346,8 +344,8 @@ func parseHexBitmap(s string) (map[int]bool, error) {
 		if err != nil {
 			return nil, err
 		}
-		for b := 0; b < 64; b++ {
-			if val&(1<<uint(b)) != 0 {
+		for b := range 64 {
+			if val&(1<<b) != 0 {
 				bits[w*64+b] = true
 			}
 		}
@@ -398,9 +396,9 @@ func normalizeIgnored(list []string) []string {
 
 // --- Execução ---
 
-// runProfile prepara a HOME isolada do perfil e executa o mcpelauncher
-// via Flatpak, passando HOME e XDG_* no ambiente do processo (não como
-// --env do Flatpak, que sobrescreveria tudo).
+// runprofile prepara a home isolada do perfil e executa o mcpelauncher
+// via flatpak, passando home e xdg_* no ambiente do processo (não como
+// --env do flatpak, que sobrescreveria tudo).
 func runProfile(name string) error {
 	p, err := loadProfile(name)
 	if err != nil {
@@ -412,14 +410,19 @@ func runProfile(name string) error {
 		return fmt.Errorf("preparar HOME: %w", err)
 	}
 
-	// 2. garante o perfil salvo (se veio só de uma pasta em ~/mcpe-profiles/)
-	if err := saveProfile(p); err != nil {
-		return fmt.Errorf("salvar perfil: %w", err)
+	// 2. garante o perfil salvo — SÓ se ainda não existir.
+	//    Não sobrescreve config do usuário.
+	if _, err := os.Stat(filepath.Join(profilePath(name), "profile.toml")); err != nil {
+		if err := saveProfile(p); err != nil {
+			return fmt.Errorf("salvar perfil: %w", err)
+		}
 	}
 
-	// 3. garante o .desktop
-	if err := createDesktop(p); err != nil {
-		return fmt.Errorf("criar atalho: %w", err)
+	// 3. garante o .desktop — SÓ se ainda não existir.
+	if _, err := os.Stat(desktopPath(name)); err != nil {
+		if err := createDesktop(p); err != nil {
+			return fmt.Errorf("criar atalho: %w", err)
+		}
 	}
 
 	// 4. caminho absoluto da HOME isolada
@@ -452,7 +455,6 @@ func runProfile(name string) error {
 
 	args = append(args, flatpakID)
 
-	// 7. log útil para debug
 	fmt.Println("Executando MCPE:")
 	fmt.Println("  HOME             =", root)
 	fmt.Println("  XDG_CONFIG_HOME  =", filepath.Join(root, ".config"))
@@ -460,9 +462,17 @@ func runProfile(name string) error {
 	fmt.Println("  XDG_CACHE_HOME   =", filepath.Join(root, ".cache"))
 	fmt.Println("  flatpak", strings.Join(args, " "))
 
-	// 8. executa
 	cmd := exec.Command("flatpak", args...)
 	cmd.Env = env
 	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
-	return cmd.Run()
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	go func() { _ = cmd.Wait() }()
+
+	return nil
 }

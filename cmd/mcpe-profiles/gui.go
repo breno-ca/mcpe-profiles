@@ -95,8 +95,11 @@ func (g *gui) build() {
 	g.nameEntry = widget.NewEntry()
 	g.nameEntry.SetPlaceHolder("nome do perfil")
 
+	// saveBtn fica no rodapé do painel direito (sempre visível quando há perfil)
 	g.saveBtn = widget.NewButtonWithIcon("", theme.ConfirmIcon(), g.onSave)
 	g.saveBtn.Importance = widget.HighImportance
+
+	// cancelBtn fica no editBar (só aparece no modo edição do nome)
 	g.cancelBtn = widget.NewButtonWithIcon("", theme.CancelIcon(), func() {
 		g.setEditing(false)
 		g.selectProfile(g.currentName)
@@ -104,7 +107,7 @@ func (g *gui) build() {
 
 	g.editBar = container.NewBorder(
 		nil, nil, nil,
-		container.NewHBox(g.saveBtn, g.cancelBtn),
+		g.cancelBtn,
 		g.nameEntry,
 	)
 	g.editBar.Hide()
@@ -174,7 +177,7 @@ func (g *gui) build() {
 			container.NewBorder(
 				nil, nil,
 				g.deleteBtn,
-				g.runBtn,
+				container.NewHBox(g.saveBtn, g.runBtn),
 				widget.NewLabel(""),
 			),
 		),
@@ -260,13 +263,22 @@ func (g *gui) onRenameToggle() {
 }
 
 func (g *gui) onSave() {
-	name := strings.TrimSpace(g.nameEntry.Text)
+	// se não está editando, salva o perfil atual
+	name := g.currentName
+	if g.editing {
+		name = strings.TrimSpace(g.nameEntry.Text)
+	}
 	if err := validateProfileName(name); err != nil {
 		g.showErr(err)
 		return
 	}
+	if name == "" {
+		g.showErr(errors.New("selecione um perfil ou crie um novo"))
+		return
+	}
 
-	if g.currentName != "" && g.currentName != name {
+	// renomeação (só quando está no modo edição e o nome mudou)
+	if g.editing && g.currentName != "" && g.currentName != name {
 		if err := renameProfile(g.currentName, name); err != nil {
 			g.showErr(err)
 			return
@@ -274,10 +286,20 @@ func (g *gui) onSave() {
 		removeDesktop(g.currentName)
 	}
 
+	// coleta o estado atual dos checks
+	selected := g.selectedControllers()
+	if len(selected) == 0 {
+		// se o usuário não marcou nada mas o perfil já tinha controllers salvos,
+		// preserva (cobre o caso de um device desconectar entre abrir e salvar)
+		if existing, err := loadProfile(name); err == nil {
+			selected = existing.IgnoredControllers
+		}
+	}
+
 	p := Profile{
 		Name:               name,
 		Home:               profileHome(name),
-		IgnoredControllers: g.selectedControllers(),
+		IgnoredControllers: selected,
 	}
 	if err := saveProfile(p); err != nil {
 		g.showErr(err)
@@ -334,9 +356,31 @@ func (g *gui) onRun() {
 		g.showErr(errors.New("selecione um perfil primeiro"))
 		return
 	}
+
+	// persiste o estado atual dos checks ANTES de rodar
+	// (o runProfile lê do disco)
+	selected := g.selectedControllers()
+	if len(selected) == 0 {
+		if existing, err := loadProfile(g.currentName); err == nil {
+			selected = existing.IgnoredControllers
+		}
+	}
+	p := Profile{
+		Name:               g.currentName,
+		Home:               profileHome(g.currentName),
+		IgnoredControllers: selected,
+	}
+	if err := saveProfile(p); err != nil {
+		g.showErr(err)
+		return
+	}
+
 	g.statusLabel.SetText("Iniciando…")
-	g.showErr(runProfile(g.currentName))
-	g.statusLabel.SetText("")
+	if err := runProfile(g.currentName); err != nil {
+		g.showErr(err)
+		return
+	}
+	g.statusLabel.SetText("Rodando: " + g.currentName)
 }
 
 // ---------- controles ----------
@@ -370,7 +414,7 @@ func (g *gui) populateControllers(selected []string) {
 func (g *gui) selectedControllers() []string {
 	var out []string
 	for i, chk := range g.checkRefs {
-		if chk.Checked {
+		if chk.Checked && i < len(g.controllers) {
 			out = append(out, g.controllers[i].Key())
 		}
 	}
@@ -393,6 +437,7 @@ func (g *gui) setRightPanelEnabled(on bool) {
 	set(g.runBtn)
 	set(g.deleteBtn)
 	set(g.refreshCtrlBtn)
+	set(g.saveBtn)
 	for _, chk := range g.checkRefs {
 		set(chk)
 	}
