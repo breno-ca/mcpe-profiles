@@ -52,8 +52,12 @@ func applicationsPath() string { return filepath.Join(homeDir(), ".local", "shar
 
 func profilePath(name string) string { return filepath.Join(profilesPath(), name) }
 
-// profileHome é a única fonte de verdade para a home.
-// Mantida como já era.
+// subhomeRoot é a raiz onde ficam as HOMEs isoladas dos perfis.
+// É a única fonte de verdade — nada de "subhome" hardcoded solto por aí.
+func subhomeRoot() string { return filepath.Join(homeDir(), "mcpe-profiles") }
+
+// profileHome devolve o caminho da HOME isolada de um perfil,
+// no formato "~/mcpe-profiles/<nome>".
 func profileHome(name string) string { return subhomePrefix + name }
 
 func expandHome(path string) string {
@@ -92,7 +96,8 @@ func saveProfile(p Profile) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(expandHome(p.Home), 0o755); err != nil {
+	// garante a HOME do perfil
+	if err := ensureProfileHome(p.Name); err != nil {
 		return err
 	}
 
@@ -118,7 +123,7 @@ func loadProfile(name string) (Profile, error) {
 
 	data, err := os.ReadFile(filepath.Join(dir, "profile.toml"))
 	if err != nil {
-		// perfil ainda não salvo — só existe a pasta em ~/subhome/
+		// perfil ainda não salvo — só existe a pasta em ~/mcpe-profiles/
 		return p, nil
 	}
 	for _, line := range strings.Split(string(data), "\n") {
@@ -149,12 +154,30 @@ func loadProfile(name string) (Profile, error) {
 	return p, nil
 }
 
-// listProfiles inclui perfis salvos e pastas existentes em ~/subhome/
-// que ainda não têm perfil salvo.
+// ensureProfileHome cria a árvore de diretórios que o mcpelauncher
+// espera encontrar quando XDG_* apontam para dentro da HOME isolada.
+func ensureProfileHome(name string) error {
+	root := expandHome(profileHome(name))
+	dirs := []string{
+		root,
+		filepath.Join(root, ".config"),
+		filepath.Join(root, ".local", "share"),
+		filepath.Join(root, ".cache"),
+	}
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// listProfiles inclui perfis salvos em ~/.config/mcpe-profiles/profiles/
+// e pastas já existentes em ~/mcpe-profiles/.
 func listProfiles() []string {
 	seen := map[string]bool{}
 
-	// 1. perfis salvos
+	// 1. perfis salvos (config)
 	if entries, err := os.ReadDir(profilesPath()); err == nil {
 		for _, e := range entries {
 			if e.IsDir() {
@@ -163,9 +186,8 @@ func listProfiles() []string {
 		}
 	}
 
-	// 2. pastas em ~/subhome/
-	subhome := filepath.Join(homeDir(), "subhome")
-	if entries, err := os.ReadDir(subhome); err == nil {
+	// 2. pastas na raiz da subhome (corrigido: usa subhomeRoot())
+	if entries, err := os.ReadDir(subhomeRoot()); err == nil {
 		for _, e := range entries {
 			if e.IsDir() {
 				seen[e.Name()] = true
@@ -228,7 +250,13 @@ func createDesktop(p Profile) error {
 		return err
 	}
 	content := fmt.Sprintf(
-		"[Desktop Entry]\nType=Application\nName=MCPE - %s\nExec=%q -profile %s\nIcon=%s\nTerminal=false\nCategories=Game;\n",
+		"[Desktop Entry]\n"+
+			"Type=Application\n"+
+			"Name=MCPE - %s\n"+
+			"Exec=%q -profile %s\n"+
+			"Icon=%s\n"+
+			"Terminal=false\n"+
+			"Categories=Game;\n",
 		p.Name, exe, p.Name, flatpakID,
 	)
 	return os.WriteFile(desktopPath(p.Name), []byte(content), 0o755)
@@ -309,7 +337,7 @@ func isGameController(ev string) bool {
 	return false
 }
 
-// parseHexBitmap converte "ff000000 0000..." em um []uint64 de bits.
+// parseHexBitmap converte "ff000000 0000..." em um map[int]bool de bits.
 func parseHexBitmap(s string) (map[int]bool, error) {
 	bits := map[int]bool{}
 	words := strings.Fields(strings.TrimSpace(s))
@@ -370,29 +398,71 @@ func normalizeIgnored(list []string) []string {
 
 // --- Execução ---
 
+// runProfile prepara a HOME isolada do perfil e executa o mcpelauncher
+// via Flatpak, passando HOME e XDG_* no ambiente do processo (não como
+// --env do Flatpak, que sobrescreveria tudo).
 func runProfile(name string) error {
 	p, err := loadProfile(name)
 	if err != nil {
 		return err
 	}
-	h := expandHome(p.Home)
-	if h == "" {
+
+	// 1. garante a árvore da HOME (cria se não existir)
+	if err := ensureProfileHome(name); err != nil {
+		return fmt.Errorf("preparar HOME: %w", err)
+	}
+
+	// 2. garante o perfil salvo (se veio só de uma pasta em ~/mcpe-profiles/)
+	if err := saveProfile(p); err != nil {
+		return fmt.Errorf("salvar perfil: %w", err)
+	}
+
+	// 3. garante o .desktop
+	if err := createDesktop(p); err != nil {
+		return fmt.Errorf("criar atalho: %w", err)
+	}
+
+	// 4. caminho absoluto da HOME isolada
+	root := expandHome(profileHome(name))
+	if root == "" {
 		return errors.New("HOME inválido")
 	}
 
+	// 5. ambiente do processo `flatpak`:
+	//    HOME + XDG_* → repassados pelo Flatpak para o sandbox.
+	env := append(
+		os.Environ(),
+		"HOME="+root,
+		"XDG_CONFIG_HOME="+filepath.Join(root, ".config"),
+		"XDG_DATA_HOME="+filepath.Join(root, ".local", "share"),
+		"XDG_CACHE_HOME="+filepath.Join(root, ".cache"),
+	)
+
+	// 6. argumentos do `flatpak run`:
+	//    SDL_* → passados via --env= (o SDL dentro do sandbox precisa vê-los).
 	args := []string{
 		"run",
-		"--env=HOME=" + h,
 		"--env=SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1",
 	}
+
 	if ignored := normalizeIgnored(p.IgnoredControllers); len(ignored) > 0 {
-		args = append(args, "--env=SDL_GAMECONTROLLER_IGNORE_DEVICES="+strings.Join(ignored, ","))
+		args = append(args,
+			"--env=SDL_GAMECONTROLLER_IGNORE_DEVICES="+strings.Join(ignored, ","))
 	}
+
 	args = append(args, flatpakID)
 
-	fmt.Println("Executando MCPE:\nflatpak", strings.Join(args, " "))
+	// 7. log útil para debug
+	fmt.Println("Executando MCPE:")
+	fmt.Println("  HOME             =", root)
+	fmt.Println("  XDG_CONFIG_HOME  =", filepath.Join(root, ".config"))
+	fmt.Println("  XDG_DATA_HOME    =", filepath.Join(root, ".local", "share"))
+	fmt.Println("  XDG_CACHE_HOME   =", filepath.Join(root, ".cache"))
+	fmt.Println("  flatpak", strings.Join(args, " "))
 
+	// 8. executa
 	cmd := exec.Command("flatpak", args...)
+	cmd.Env = env
 	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
 	return cmd.Run()
 }

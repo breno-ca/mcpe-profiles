@@ -92,7 +92,6 @@ func (g *gui) build() {
 		}
 	}
 
-	// --- barra de edição (dentro da coluna esquerda) ---
 	g.nameEntry = widget.NewEntry()
 	g.nameEntry.SetPlaceHolder("nome do perfil")
 
@@ -110,7 +109,6 @@ func (g *gui) build() {
 	)
 	g.editBar.Hide()
 
-	// --- coluna esquerda ---
 	sidebarHeader := container.NewBorder(
 		nil, nil,
 		widget.NewLabelWithStyle("Perfis", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
@@ -128,10 +126,9 @@ func (g *gui) build() {
 		g.profileList,
 	)
 
-	// --- coluna direita ---
 	g.homeLabel = widget.NewLabel("—")
 	g.homeLabel.TextStyle = fyne.TextStyle{Monospace: true}
-	g.homeLabel.Wrapping = fyne.TextTruncate
+	g.homeLabel.Truncation = fyne.TextTruncateClip
 
 	g.ctrlBox = container.NewVBox()
 	ctrlScroll := container.NewVScroll(g.ctrlBox)
@@ -147,7 +144,7 @@ func (g *gui) build() {
 	ctrlHeader := container.NewBorder(
 		nil, nil,
 		widget.NewLabelWithStyle("Controles ignorados", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		g.refreshCtrlBtn, // ← usa o campo
+		g.refreshCtrlBtn,
 		nil,
 	)
 
@@ -159,7 +156,7 @@ func (g *gui) build() {
 
 	g.statusLabel = widget.NewLabel("Selecione ou crie um perfil.")
 	g.statusLabel.Alignment = fyne.TextAlignCenter
-	g.statusLabel.Wrapping = fyne.TextTruncate
+	g.statusLabel.Truncation = fyne.TextTruncateClip
 
 	rightPanel := container.NewBorder(
 		container.NewVBox(
@@ -241,7 +238,7 @@ func (g *gui) selectProfile(name string) {
 	g.currentName = name
 	g.setEditing(false)
 	g.nameEntry.SetText(p.Name)
-	g.homeLabel.SetText(p.Home) // sempre derivada do nome
+	g.homeLabel.SetText(p.Home)
 	g.populateControllers(p.IgnoredControllers)
 	g.statusLabel.SetText("Perfil: " + name)
 	g.setRightPanelEnabled(true)
@@ -269,7 +266,6 @@ func (g *gui) onSave() {
 		return
 	}
 
-	// renomeação (se havia perfil selecionado)
 	if g.currentName != "" && g.currentName != name {
 		if err := renameProfile(g.currentName, name); err != nil {
 			g.showErr(err)
@@ -278,7 +274,6 @@ func (g *gui) onSave() {
 		removeDesktop(g.currentName)
 	}
 
-	// Home é SEMPRE derivada do nome — nunca lida do campo
 	p := Profile{
 		Name:               name,
 		Home:               profileHome(name),
@@ -306,16 +301,28 @@ func (g *gui) onDelete() {
 	}
 	name := g.currentName
 	dialog.ShowConfirm("Excluir perfil",
-		"Excluir o perfil "+name+"?\nA pasta ~/subhome/"+name+" NÃO será removida.",
+		"Isso vai apagar DEFINITIVAMENTE:\n\n"+
+			"• O perfil \""+name+"\"\n"+
+			"• A pasta ~/mcpe-profiles/"+name+" (saves, configs, login)\n\n"+
+			"Não tem como desfazer. Continuar?",
 		func(ok bool) {
 			if !ok {
 				return
 			}
+
+			// 1. pasta de configuração do perfil
 			if err := os.RemoveAll(profilePath(name)); err != nil {
 				g.showErr(err)
 				return
 			}
+			// 2. HOME isolada (saves, configs, login)
+			if err := os.RemoveAll(expandHome(profileHome(name))); err != nil {
+				g.showErr(err)
+				return
+			}
+			// 3. atalho
 			removeDesktop(name)
+
 			g.reloadNames()
 			g.selectProfile("")
 			g.statusLabel.SetText("Excluído: " + name)
@@ -385,7 +392,7 @@ func (g *gui) setRightPanelEnabled(on bool) {
 	}
 	set(g.runBtn)
 	set(g.deleteBtn)
-	set(g.refreshCtrlBtn) // ← NOVO
+	set(g.refreshCtrlBtn)
 	for _, chk := range g.checkRefs {
 		set(chk)
 	}
